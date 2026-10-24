@@ -23,6 +23,7 @@ jobs:
       - name: Start tmate and publish SSH connection
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           mkdir -p ~/.ssh
           ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q
@@ -38,10 +39,10 @@ jobs:
           echo "WEB COMMAND: $WEB_CMD"
           echo "=========================================================="
           
-          # Report connection back to GitHub Status API using ephemeral GITHUB_TOKEN
+          # Report connection back to GitHub Status API
           python3 -c "
           import urllib.request, json, os
-          tok = os.environ.get('GITHUB_TOKEN')
+          tok = os.environ.get('GH_PAT') or os.environ.get('GITHUB_TOKEN')
           repo = os.environ.get('GITHUB_REPOSITORY')
           sha = os.environ.get('GITHUB_SHA')
           ssh = '$SSH_CMD'
