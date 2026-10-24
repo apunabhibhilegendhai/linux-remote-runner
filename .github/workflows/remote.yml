@@ -29,12 +29,21 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q
           
-          # Start tmate socket cleanly without -F
+          # Start tmate socket
           tmate -S /tmp/tmate.sock new-session -d
-          timeout 20 tmate -S /tmp/tmate.sock wait tmate-ready || sleep 5
           
-          SSH_CMD=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
-          WEB_CMD=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+          echo "Waiting for tmate server connection..."
+          SSH_CMD=""
+          WEB_CMD=""
+          for i in $(seq 1 40); do
+            SSH_CMD=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
+            WEB_CMD=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}' 2>/dev/null || true)
+            if [ -n "$SSH_CMD" ] && [ -n "$WEB_CMD" ]; then
+              echo "Tmate session ready in $i seconds!"
+              break
+            fi
+            sleep 1
+          done
           
           echo "=========================================================="
           echo "SSH COMMAND: $SSH_CMD"
@@ -49,10 +58,9 @@ jobs:
           ssh = '$SSH_CMD'
           web = '$WEB_CMD'
           
-          # Create Issue
           issue_data = json.dumps({
-              'title': 'LIVE_SSH_CONNECTION',
-              'body': f'### 🚀 Live Linux Terminal Ready (US-East)\n- **Web Terminal:** {web}\n- **SSH Command:** \`{ssh}\`\n- **Direct SSH:** {ssh}'
+              'title': 'SSH_READY',
+              'body': f'### Live Linux Terminal (US-East)\n- **Web Terminal:** {web}\n- **SSH Command:** \`{ssh}\`\n- **Direct SSH:** {ssh}'
           }).encode()
           
           req_issue = urllib.request.Request(f'https://api.github.com/repos/{repo}/issues', data=issue_data, headers={
@@ -62,7 +70,7 @@ jobs:
           })
           try:
               with urllib.request.urlopen(req_issue) as resp:
-                  print('Issue created successfully! Status:', resp.status)
+                  print('Issue created! Status:', resp.status)
           except Exception as e:
               print('Issue creation error:', e)
           "
