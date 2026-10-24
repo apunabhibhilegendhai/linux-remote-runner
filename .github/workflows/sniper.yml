@@ -31,15 +31,30 @@ jobs:
       - name: Optimize Linux Kernel & Network Stack (BBR & Fast Open)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y bzip2 curl wget tmux htop nano
+          sudo apt-get install -y bzip2 curl wget tmux htop nano ethtool || true
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
           sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
           sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0 || true
           sudo sysctl -w net.ipv4.tcp_notsent_lowat=16384 || true
           sudo sysctl -w net.ipv4.tcp_tw_reuse=1 || true
-          sudo sysctl -w net.core.rmem_max=16777216 || true
-          sudo sysctl -w net.core.wmem_max=16777216 || true
+          sudo sysctl -w net.core.rmem_max=33554432 || true
+          sudo sysctl -w net.core.wmem_max=33554432 || true
+          sudo sysctl -w net.core.rmem_default=8388608 || true
+          sudo sysctl -w net.core.wmem_default=8388608 || true
           sudo sysctl -w net.core.default_qdisc=fq || true
+          sudo sysctl -w net.core.netdev_max_backlog=65536 || true
+          sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65536 || true
+          sudo sysctl -w net.ipv4.tcp_autocorking=0 || true
+          sudo sysctl -w net.ipv4.tcp_sack=1 || true
+          sudo sysctl -w net.ipv4.tcp_dsack=1 || true
+          sudo sysctl -w net.ipv4.tcp_timestamps=1 || true
+          sudo sysctl -w net.ipv4.tcp_window_scaling=1 || true
+          sudo sysctl -w net.ipv4.tcp_fin_timeout=10 || true
+          # Zero-latency physical NIC interrupt coalescing bypass
+          IFACE=$(ip route show default | awk '{print $5}')
+          if [ -n "$IFACE" ]; then
+            sudo ethtool -C "$IFACE" adaptive-rx off rx-usecs 0 || true
+          fi
 
       - name: Restore Persistent State (configs, grace.json & progress)
         uses: actions/cache@v4
@@ -209,7 +224,8 @@ jobs:
                           stderr=log_file
                       )
                       subprocess.run(['sudo', 'renice', '-n', '-20', '-p', str(proc.pid)], stderr=subprocess.DEVNULL)
-                      print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ Toolkit engine started (PID: {proc.pid}, nice: -20)", flush=True)
+                      subprocess.run(['sudo', 'chrt', '-f', '-p', '99', str(proc.pid)], stderr=subprocess.DEVNULL)
+                      print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ Toolkit engine started (PID: {proc.pid}, nice: -20, SCHED_FIFO: 99)", flush=True)
 
               # 3. Synchronize state cache every 30 seconds
               if int(elapsed) % 30 == 0:
