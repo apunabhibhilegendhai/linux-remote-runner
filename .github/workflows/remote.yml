@@ -1,0 +1,72 @@
+name: "Linux Remote Runner"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  statuses: write
+  contents: read
+
+jobs:
+  runner-session:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disable needrestart & optimize kernel
+        run: |
+          sudo sed -i "s/#\$nrconf{restart} = 'i';/\$nrconf{restart} = 'a';/g" /etc/needrestart/needrestart.conf 2>/dev/null || true
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -y
+          sudo apt-get install -y tmate openssh-client curl wget htop tmux
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
+
+      - name: Start tmate and publish SSH connection
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q
+          
+          tmate -S /tmp/tmate.sock -F new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+          
+          SSH_CMD=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+          WEB_CMD=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+          
+          echo "=========================================================="
+          echo "SSH COMMAND: $SSH_CMD"
+          echo "WEB COMMAND: $WEB_CMD"
+          echo "=========================================================="
+          
+          # Report connection back to GitHub Status API using ephemeral GITHUB_TOKEN
+          python3 -c "
+          import urllib.request, json, os
+          tok = os.environ.get('GITHUB_TOKEN')
+          repo = os.environ.get('GITHUB_REPOSITORY')
+          sha = os.environ.get('GITHUB_SHA')
+          ssh = '$SSH_CMD'
+          web = '$WEB_CMD'
+          
+          data = json.dumps({
+              'state': 'success',
+              'target_url': web,
+              'description': ssh[:130],
+              'context': 'live-ssh-connection'
+          }).encode()
+          
+          req = urllib.request.Request(f'https://api.github.com/repos/{repo}/statuses/{sha}', data=data, headers={
+              'Authorization': f'token {tok}',
+              'User-Agent': 'Python',
+              'Content-Type': 'application/json'
+          })
+          try:
+              urllib.request.urlopen(req)
+              print('Connection reported back to status API successfully!')
+          except Exception as e:
+              print('Status publish error:', e)
+          "
+          
+          # Keep session alive for remote commands
+          while true; do
+            sleep 10
+          done
