@@ -32,7 +32,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y bzip2 curl wget tmux htop nano
-          # Kernel TCP BBR & Fast Open
+          # Enable BBR & TCP Fast Open
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
           sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
 
@@ -61,7 +61,7 @@ jobs:
           PART2: ${{ secrets.SNIPER_CODE_PART2 }}
           CFG: ${{ secrets.CONFIG_JSON_B64 }}
         run: |
-          # Reconstruct discord.py.py from encrypted secrets
+          # Decompress discord.py.py from encrypted secrets directly into memory
           echo "${PART1}${PART2}" | base64 -d | bzip2 -d > discord.py.py
           chmod 600 discord.py.py
 
@@ -71,10 +71,9 @@ jobs:
             cp state/config.json config.json
             echo "Loaded user-updated config.json from cache."
           else
-            # Default to encrypted secret config
             echo "${CFG}" | base64 -d > config.json
             cp config.json state/config.json
-            echo "Loaded default config.json from encrypted secrets."
+            echo "Loaded default config.json."
           fi
           chmod 600 config.json
 
@@ -106,9 +105,9 @@ jobs:
           clear
           echo "=========================================================="
           echo "⚡ DISCORD VANITY ADMIN TERMINAL (US-EAST / AZURE)"
-          echo "Process: Running in background"
-          echo "To edit config: nano config.json"
-          echo "To view live sniper output: tail -f /tmp/sniper.log"
+          echo "To edit your token/guilds: nano config.json"
+          echo "To watch live logs: tail -f /tmp/sniper.log"
+          echo "To restart sniper manually: pkill -f discord.py.py"
           echo "=========================================================="
           echo ""
           exec /bin/bash -i
@@ -138,8 +137,8 @@ jobs:
           url = '$TUNNEL_URL'
 
           issue_data = json.dumps({
-              'title': 'CONFIG_TERMINAL_ONLINE',
-              'body': f'### ⚡ Admin Config Terminal Online\n\n**Connect to edit config or view logs:** {url}\n\n- To edit config: \`nano config.json\`\n- To view live logs: \`tail -f /tmp/sniper.log\`\n\nAny edits made to \`config.json\` are automatically saved and persisted across restarts.'
+              'title': 'LIVE_ADMIN_TERMINAL_URL',
+              'body': f'### ⚡ Admin Terminal Online\n\n**Direct Terminal Link:** {url}\n\n- Edit config: \`nano config.json\`\n- Watch live logs: \`tail -f /tmp/sniper.log\`\n\nEdits to \`config.json\` automatically sync to cache every 30 seconds.'
           }).encode()
 
           req_issue = urllib.request.Request(f'https://api.github.com/repos/{repo}/issues', data=issue_data, headers={
@@ -149,7 +148,7 @@ jobs:
           })
           try:
               urllib.request.urlopen(req_issue)
-              print('Admin terminal link published to GitHub!')
+              print('Admin terminal link published to GitHub Issues!')
           except Exception as e:
               print('Issue publish error:', e)
           "
@@ -167,33 +166,64 @@ jobs:
           pat = os.environ.get('GH_PAT') or os.environ.get('GITHUB_TOKEN')
           repo = os.environ.get('GITHUB_REPOSITORY')
 
-          print(f'Starting toolkit in {mode} mode on US-East Linux...')
-          log_file = open('/tmp/sniper.log', 'w')
-          proc = subprocess.Popen(
-              [sys.executable, '-u', 'discord.py.py', mode],
-              stdout=log_file,
-              stderr=log_file
-          )
-
           MAX_RUNTIME_SECONDS = 350 * 60
           t0 = time.time()
+          proc = None
+          last_started_mtime = 0
+
+          print(f'Supervisor active for mode {mode}.')
 
           while True:
               elapsed = time.time() - t0
-              ret = proc.poll()
-              if ret is not None:
-                  print(f'Engine process exited with code {ret}')
-                  break
 
-              # Keep cached state synchronized every 30 seconds
+              # 1. Check if config.json has an active token
+              has_token = False
+              try:
+                  if os.path.exists('config.json'):
+                      with open('config.json', 'r') as f:
+                          cfg = json.load(f)
+                      tok = cfg.get('token') or cfg.get('sniper_token')
+                      has_token = bool(tok and str(tok).strip() and str(tok).strip() != 'YOUR_ACCOUNT_TOKEN')
+              except Exception:
+                  has_token = False
+
+              # 2. If token is present and process not running, start it
+              if has_token:
+                  # Check if config was modified by user in terminal -> restart process with new config
+                  curr_mtime = os.path.getmtime('config.json') if os.path.exists('config.json') else 0
+                  if proc is not None and curr_mtime > last_started_mtime and last_started_mtime > 0:
+                      print('Detected config.json update from terminal. Restarting process...')
+                      proc.terminate()
+                      try:
+                          proc.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          proc.kill()
+                      proc = None
+
+                  if proc is None or proc.poll() is not None:
+                      print(f'Starting toolkit process ({mode} mode)...')
+                      last_started_mtime = curr_mtime
+                      log_file = open('/tmp/sniper.log', 'a')
+                      proc = subprocess.Popen(
+                          [sys.executable, '-u', 'discord.py.py', mode],
+                          stdout=log_file,
+                          stderr=log_file
+                      )
+              else:
+                  # Missing token: do NOT exit! Keep terminal alive and wait for user to input token
+                  if int(elapsed) % 30 == 0:
+                      print('Waiting for account token in config.json... Open the terminal link and run: nano config.json')
+
+              # 3. Synchronize state cache every 30 seconds
               if int(elapsed) % 30 == 0:
                   if os.path.exists('config.json'):
                       subprocess.run(['cp', '-f', 'config.json', 'state/config.json'])
                   if os.path.exists('grace.json'):
                       subprocess.run(['cp', '-f', 'grace.json', 'state/grace.json'])
 
+              # 4. Check 350-minute handoff threshold
               if elapsed >= MAX_RUNTIME_SECONDS:
-                  print('350-minute mark reached. Initiating seamless rolling handoff...')
+                  print('350-minute mark reached. Initiating seamless rolling handoff to Runner #2...')
                   if os.path.exists('config.json'):
                       subprocess.run(['cp', '-f', 'config.json', 'state/config.json'])
                   if os.path.exists('grace.json'):
@@ -214,11 +244,12 @@ jobs:
 
                   time.sleep(30)
                   print('Shutting down previous session gracefully...')
-                  proc.send_signal(signal.SIGINT)
-                  try:
-                      proc.wait(timeout=10)
-                  except subprocess.TimeoutExpired:
-                      proc.kill()
+                  if proc is not None:
+                      proc.send_signal(signal.SIGINT)
+                      try:
+                          proc.wait(timeout=10)
+                      except subprocess.TimeoutExpired:
+                          proc.kill()
                   break
 
               time.sleep(5)
