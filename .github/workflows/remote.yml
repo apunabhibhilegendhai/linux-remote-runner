@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
 
 permissions:
+  contents: write
+  issues: write
   statuses: write
-  contents: read
 
 jobs:
   runner-session:
@@ -22,14 +23,15 @@ jobs:
 
       - name: Start tmate and publish SSH connection
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p ~/.ssh
           ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q
           
-          tmate -S /tmp/tmate.sock -F new-session -d
-          tmate -S /tmp/tmate.sock wait tmate-ready
+          # Start tmate socket cleanly without -F
+          tmate -S /tmp/tmate.sock new-session -d
+          timeout 20 tmate -S /tmp/tmate.sock wait tmate-ready || sleep 5
           
           SSH_CMD=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
           WEB_CMD=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
@@ -39,35 +41,33 @@ jobs:
           echo "WEB COMMAND: $WEB_CMD"
           echo "=========================================================="
           
-          # Report connection back to GitHub Status API
+          # Publish connection as a GitHub Issue for guaranteed retrieval
           python3 -c "
           import urllib.request, json, os
           tok = os.environ.get('GH_PAT') or os.environ.get('GITHUB_TOKEN')
           repo = os.environ.get('GITHUB_REPOSITORY')
-          sha = os.environ.get('GITHUB_SHA')
           ssh = '$SSH_CMD'
           web = '$WEB_CMD'
           
-          data = json.dumps({
-              'state': 'success',
-              'target_url': web,
-              'description': ssh[:130],
-              'context': 'live-ssh-connection'
+          # Create Issue
+          issue_data = json.dumps({
+              'title': 'LIVE_SSH_CONNECTION',
+              'body': f'### 🚀 Live Linux Terminal Ready (US-East)\n- **Web Terminal:** {web}\n- **SSH Command:** \`{ssh}\`\n- **Direct SSH:** {ssh}'
           }).encode()
           
-          req = urllib.request.Request(f'https://api.github.com/repos/{repo}/statuses/{sha}', data=data, headers={
+          req_issue = urllib.request.Request(f'https://api.github.com/repos/{repo}/issues', data=issue_data, headers={
               'Authorization': f'token {tok}',
               'User-Agent': 'Python',
               'Content-Type': 'application/json'
           })
           try:
-              urllib.request.urlopen(req)
-              print('Connection reported back to status API successfully!')
+              with urllib.request.urlopen(req_issue) as resp:
+                  print('Issue created successfully! Status:', resp.status)
           except Exception as e:
-              print('Status publish error:', e)
+              print('Issue creation error:', e)
           "
           
-          # Keep session alive for remote commands
+          # Keep session running for remote commands
           while true; do
             sleep 10
           done
