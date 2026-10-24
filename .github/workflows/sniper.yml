@@ -70,13 +70,13 @@ jobs:
           chmod 600 discord.py.py
 
           mkdir -p state
-          if [ -f "state/config.json" ]; then
+          if [ -f "state/config.json" ] && ! grep -q '"token": ""' state/config.json && ! grep -q '"sniper_token": ""' state/config.json; then
             cp state/config.json config.json
             echo "Loaded user-updated config.json from cache."
           else
             echo "${CFG}" | base64 -d > config.json
             cp config.json state/config.json
-            echo "Loaded default config.json."
+            echo "Loaded valid config.json from secrets."
           fi
           chmod 600 config.json
 
