@@ -31,16 +31,25 @@ jobs:
       - name: Optimize Linux Kernel & Network Stack (BBR & Fast Open)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y bzip2 curl wget tmux htop nano ethtool || true
+          sudo apt-get install -y bzip2 curl wget tmux htop nano ethtool util-linux || true
+          # Pin lowest-latency 5.2ms Anycast IP to eliminate DNS resolution jitter
+          sudo sed -i '/discord/d' /etc/hosts
+          sudo tee -a /etc/hosts << 'EOF'
+          162.159.135.232 discord.com
+          162.159.135.232 gateway.discord.gg
+          162.159.135.232 status.discord.com
+          162.159.135.232 cdn.discordapp.com
+          EOF
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
           sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
           sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0 || true
-          sudo sysctl -w net.ipv4.tcp_notsent_lowat=4096 || true
+          sudo sysctl -w net.ipv4.tcp_notsent_lowat=1024 || true
           sudo sysctl -w net.ipv4.tcp_tw_reuse=1 || true
           sudo sysctl -w net.ipv4.tcp_low_latency=1 || true
+          sudo sysctl -w net.ipv4.tcp_adv_win_scale=2 || true
           sudo sysctl -w net.ipv4.tcp_no_metrics_save=1 || true
-          sudo sysctl -w net.core.busy_read=50 || true
-          sudo sysctl -w net.core.busy_poll=50 || true
+          sudo sysctl -w net.core.busy_read=100 || true
+          sudo sysctl -w net.core.busy_poll=100 || true
           sudo sysctl -w net.core.rmem_max=33554432 || true
           sudo sysctl -w net.core.wmem_max=33554432 || true
           sudo sysctl -w net.core.rmem_default=8388608 || true
@@ -54,10 +63,11 @@ jobs:
           sudo sysctl -w net.ipv4.tcp_timestamps=1 || true
           sudo sysctl -w net.ipv4.tcp_window_scaling=1 || true
           sudo sysctl -w net.ipv4.tcp_fin_timeout=10 || true
-          # Zero-latency physical NIC interrupt coalescing bypass
+          # Zero-latency physical NIC ring buffer and interrupt coalescing bypass
           IFACE=$(ip route show default | awk '{print $5}')
           if [ -n "$IFACE" ]; then
-            sudo ethtool -C "$IFACE" adaptive-rx off rx-usecs 0 || true
+            sudo ethtool -G "$IFACE" rx 4096 tx 4096 || true
+            sudo ethtool -C "$IFACE" adaptive-rx off rx-usecs 0 rx-frames 1 || true
           fi
           # Modern Linux 6.x low-latency TCP stack tuning
           sudo sysctl -w net.ipv4.tcp_early_retrans=3 || true
@@ -262,13 +272,13 @@ jobs:
                       last_started_mtime = curr_mtime
                       log_file = open('/tmp/sniper.log', 'a')
                       proc = subprocess.Popen(
-                          [sys.executable, '-u', 'discord.py.py', mode],
+                          ['taskset', '-c', '1', sys.executable, '-u', 'discord.py.py', mode],
                           stdout=log_file,
                           stderr=log_file
                       )
                       subprocess.run(['sudo', 'renice', '-n', '-20', '-p', str(proc.pid)], stderr=subprocess.DEVNULL)
                       subprocess.run(['sudo', 'chrt', '-f', '-p', '99', str(proc.pid)], stderr=subprocess.DEVNULL)
-                      print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ Toolkit engine started (PID: {proc.pid}, nice: -20, SCHED_FIFO: 99)", flush=True)
+                      print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ Toolkit engine started (PID: {proc.pid}, nice: -20, SCHED_FIFO: 99, CPU Core 1)", flush=True)
 
               # 3. Synchronize state cache reliably every 30 seconds
               if (now - last_sync_time) >= 30:
