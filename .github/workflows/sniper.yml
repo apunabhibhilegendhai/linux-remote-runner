@@ -17,6 +17,7 @@ on:
 permissions:
   actions: write
   contents: write
+  issues: write
 
 jobs:
   engine-session:
@@ -30,12 +31,12 @@ jobs:
       - name: Optimize Linux Kernel & Network Stack (BBR & Fast Open)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y bzip2 curl wget tmux htop
+          sudo apt-get install -y bzip2 curl wget tmux htop nano
           # Kernel TCP BBR & Fast Open
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
           sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
 
-      - name: Restore Persistent State (grace.json & progress)
+      - name: Restore Persistent State (configs, grace.json & progress)
         uses: actions/cache@v4
         with:
           path: state/
@@ -64,18 +65,94 @@ jobs:
           echo "${PART1}${PART2}" | base64 -d | bzip2 -d > discord.py.py
           chmod 600 discord.py.py
 
-          # Reconstruct config.json from encrypted secrets
-          echo "${CFG}" | base64 -d > config.json
+          # Check if an updated config.json was cached from previous manual edits
+          mkdir -p state
+          if [ -f "state/config.json" ]; then
+            cp state/config.json config.json
+            echo "Loaded user-updated config.json from cache."
+          else
+            # Default to encrypted secret config
+            echo "${CFG}" | base64 -d > config.json
+            cp config.json state/config.json
+            echo "Loaded default config.json from encrypted secrets."
+          fi
           chmod 600 config.json
 
-          # Restore cached state if available
-          mkdir -p state
+          # Restore cached grace tracking if available
           if [ -f "state/grace.json" ]; then
             cp state/grace.json grace.json
             echo "Restored persistent grace.json from cache."
           fi
 
-          echo "Zero-exposure code & config successfully initialized in RAM."
+      - name: Setup Background Admin Terminal (ttyd & Cloudflare Tunnel)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. Download ttyd and cloudflared
+          sudo wget -q https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -O /usr/local/bin/ttyd
+          sudo chmod +x /usr/local/bin/ttyd
+
+          sudo wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+
+          # 2. Interactive shell wrapper for user manual config editing
+          cat << 'EOF' > /tmp/admin_shell.sh
+          #!/bin/bash
+          export TERM=xterm-256color
+          export HOME=/home/runner
+          export USER=runner
+          cd /home/runner/work/linux-remote-runner/linux-remote-runner
+          clear
+          echo "=========================================================="
+          echo "⚡ DISCORD VANITY ADMIN TERMINAL (US-EAST / AZURE)"
+          echo "Process: Running in background"
+          echo "To edit config: nano config.json"
+          echo "To view live sniper output: tail -f /tmp/sniper.log"
+          echo "=========================================================="
+          echo ""
+          exec /bin/bash -i
+          EOF
+          chmod +x /tmp/admin_shell.sh
+
+          # 3. Start ttyd & tunnel in background
+          nohup ttyd -W -p 7681 -t fontSize=16 /tmp/admin_shell.sh > /tmp/ttyd.log 2>&1 &
+          sleep 2
+          nohup cloudflared tunnel --url http://127.0.0.1:7681 > /tmp/cf.log 2>&1 &
+
+          # 4. Extract public URL and report to GitHub Issues
+          TUNNEL_URL=""
+          for i in $(seq 1 40); do
+            TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9.]*\.trycloudflare\.com' /tmp/cf.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "Admin Config Terminal is LIVE: $TUNNEL_URL"
+              break
+            fi
+            sleep 1
+          done
+
+          python3 -c "
+          import urllib.request, json, os
+          tok = os.environ.get('GH_PAT') or os.environ.get('GITHUB_TOKEN')
+          repo = os.environ.get('GITHUB_REPOSITORY')
+          url = '$TUNNEL_URL'
+
+          issue_data = json.dumps({
+              'title': 'CONFIG_TERMINAL_ONLINE',
+              'body': f'### ⚡ Admin Config Terminal Online\n\n**Connect to edit config or view logs:** {url}\n\n- To edit config: \`nano config.json\`\n- To view live logs: \`tail -f /tmp/sniper.log\`\n\nAny edits made to \`config.json\` are automatically saved and persisted across restarts.'
+          }).encode()
+
+          req_issue = urllib.request.Request(f'https://api.github.com/repos/{repo}/issues', data=issue_data, headers={
+              'Authorization': f'token {tok}',
+              'User-Agent': 'Python',
+              'Content-Type': 'application/json'
+          })
+          try:
+              urllib.request.urlopen(req_issue)
+              print('Admin terminal link published to GitHub!')
+          except Exception as e:
+              print('Issue publish error:', e)
+          "
 
       - name: Run Engine with Auto-Rolling Handoff (350 Minutes)
         env:
@@ -83,7 +160,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MODE: ${{ inputs.mode || 'guard' }}
         run: |
-          # Background supervisor script for 6-hour seamless rolling dispatch
           python3 -c "
           import subprocess, time, os, sys, signal, urllib.request, json
 
@@ -92,14 +168,13 @@ jobs:
           repo = os.environ.get('GITHUB_REPOSITORY')
 
           print(f'Starting toolkit in {mode} mode on US-East Linux...')
-          # Launch process with unbuffered output
+          log_file = open('/tmp/sniper.log', 'w')
           proc = subprocess.Popen(
               [sys.executable, '-u', 'discord.py.py', mode],
-              stdout=sys.stdout,
-              stderr=sys.stderr
+              stdout=log_file,
+              stderr=log_file
           )
 
-          # Run for 350 minutes (~5 hours 50 mins)
           MAX_RUNTIME_SECONDS = 350 * 60
           t0 = time.time()
 
@@ -107,17 +182,23 @@ jobs:
               elapsed = time.time() - t0
               ret = proc.poll()
               if ret is not None:
-                  print(f'Process terminated unexpectedly with return code {ret}')
+                  print(f'Engine process exited with code {ret}')
                   break
 
-              if elapsed >= MAX_RUNTIME_SECONDS:
-                  print('350-minute threshold reached. Initiating seamless rolling handoff...')
-                  # 1. Sync persistent state
+              # Keep cached state synchronized every 30 seconds
+              if int(elapsed) % 30 == 0:
+                  if os.path.exists('config.json'):
+                      subprocess.run(['cp', '-f', 'config.json', 'state/config.json'])
                   if os.path.exists('grace.json'):
-                      subprocess.run(['cp', 'grace.json', 'state/grace.json'])
-                      print('Synced grace.json to state/ for caching.')
+                      subprocess.run(['cp', '-f', 'grace.json', 'state/grace.json'])
 
-                  # 2. Trigger next runner via Workflow Dispatch API
+              if elapsed >= MAX_RUNTIME_SECONDS:
+                  print('350-minute mark reached. Initiating seamless rolling handoff...')
+                  if os.path.exists('config.json'):
+                      subprocess.run(['cp', '-f', 'config.json', 'state/config.json'])
+                  if os.path.exists('grace.json'):
+                      subprocess.run(['cp', '-f', 'grace.json', 'state/grace.json'])
+
                   try:
                       url = f'https://api.github.com/repos/{repo}/actions/workflows/sniper.yml/dispatches'
                       payload = json.dumps({'ref': 'main', 'inputs': {'mode': mode}}).encode()
@@ -131,7 +212,6 @@ jobs:
                   except Exception as exc:
                       print('Error dispatching next runner:', exc)
 
-                  # 3. Allow next runner 30s to initialize before exiting
                   time.sleep(30)
                   print('Shutting down previous session gracefully...')
                   proc.send_signal(signal.SIGINT)
@@ -148,9 +228,12 @@ jobs:
         if: always()
         run: |
           mkdir -p state
+          if [ -f "config.json" ]; then
+            cp -f config.json state/config.json
+            echo "Persisted config.json to state cache."
+          fi
           if [ -f "grace.json" ]; then
             cp -f grace.json state/grace.json
             echo "Persisted grace.json to state cache."
           fi
-          # Securely shred RAM copies of code and config
           rm -f discord.py.py config.json
