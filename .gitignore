@@ -1,0 +1,16 @@
+# Ignore all python code and configuration files
+*.py
+*.json
+config.json
+config.example.json
+grace.json
+discord.py.py
+
+# Python bytecode & cache
+__pycache__/
+*.pyc
+
+# Local environments and captures
+captures/
+venv/
+.env
