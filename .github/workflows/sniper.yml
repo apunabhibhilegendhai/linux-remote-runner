@@ -59,6 +59,15 @@ jobs:
           if [ -n "$IFACE" ]; then
             sudo ethtool -C "$IFACE" adaptive-rx off rx-usecs 0 || true
           fi
+          # Modern Linux 6.x low-latency TCP stack tuning
+          sudo sysctl -w net.ipv4.tcp_early_retrans=3 || true
+          sudo sysctl -w net.ipv4.tcp_recovery=1 || true
+          sudo sysctl -w net.ipv4.tcp_thin_linear_timeouts=1 || true
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" || true
+          # Lock CPU Governor to performance to eliminate frequency downscaling jitter
+          for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            echo performance | sudo tee "$g" >/dev/null 2>&1 || true
+          done
 
       - name: Restore Persistent State (configs, grace.json & progress)
         uses: actions/cache@v4
@@ -85,17 +94,25 @@ jobs:
           PART2: ${{ secrets.SNIPER_CODE_PART2 }}
           CFG: ${{ secrets.CONFIG_JSON_B64 }}
         run: |
-          echo "${PART1}${PART2}" | base64 -d | bzip2 -d > discord.py.py
+          if [ -n "${PART1}" ]; then
+            echo "${PART1}${PART2}" | base64 -d | bzip2 -d > discord.py.py
+            echo "Loaded encrypted discord.py.py from secrets."
+          else
+            echo "Using repository discord.py.py."
+          fi
           chmod 600 discord.py.py
 
           mkdir -p state
-          if [ -f "state/config.json" ] && ! grep -q '"token": ""' state/config.json && ! grep -q '"sniper_token": ""' state/config.json; then
+          if [ -f "state/config.json" ] && ! grep -q '"token": ""' state/config.json && ! grep -q '"sniper_token": ""' state/config.json && ! grep -q 'YOUR_.*TOKEN' state/config.json; then
             cp state/config.json config.json
             echo "Loaded user-updated config.json from cache."
-          else
+          elif [ -n "${CFG}" ]; then
             echo "${CFG}" | base64 -d > config.json
             cp config.json state/config.json
             echo "Loaded valid config.json from secrets."
+          elif [ -f "config.json" ]; then
+            cp config.json state/config.json
+            echo "Loaded config.json from repository."
           fi
           chmod 600 config.json
 
@@ -148,10 +165,14 @@ jobs:
           done
 
           python3 -c "
-          import urllib.request, json, os
+          import urllib.request, json, os, sys
           tok = os.environ.get('GH_PAT') or os.environ.get('GITHUB_TOKEN')
           repo = os.environ.get('GITHUB_REPOSITORY')
           url = '$TUNNEL_URL'
+
+          if not url or 'trycloudflare.com' not in url:
+              print('No active Cloudflare tunnel URL detected; skipping issue creation.')
+              sys.exit(0)
 
           issue_data = json.dumps({
               'title': 'LIVE_ADMIN_TERMINAL_URL',
@@ -187,6 +208,10 @@ jobs:
           MAX_RUNTIME_SECONDS = 350 * 60
           t0 = time.time()
           last_heartbeat = -300
+          last_sync_time = 0
+          crash_count = 0
+          last_crash_time = 0
+          restart_delay = 0
           proc = None
           last_started_mtime = 0
 
@@ -203,23 +228,37 @@ jobs:
                       with open('config.json', 'r') as f:
                           cfg = json.load(f)
                       tok = cfg.get('token') or cfg.get('sniper_token')
-                      has_token = bool(tok and str(tok).strip() and str(tok).strip() != 'YOUR_ACCOUNT_TOKEN')
+                      has_token = bool(tok and str(tok).strip() and not str(tok).strip().startswith('YOUR_'))
               except Exception:
                   has_token = False
 
-              # 2. Process management
-              if has_token:
-                  curr_mtime = os.path.getmtime('config.json') if os.path.exists('config.json') else 0
-                  if proc is not None and curr_mtime > last_started_mtime and last_started_mtime > 0:
-                      print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 Detected config.json update from terminal. Reloading engine...", flush=True)
-                      proc.terminate()
-                      try:
-                          proc.wait(timeout=5)
-                      except subprocess.TimeoutExpired:
-                          proc.kill()
-                      proc = None
+              # 2. Process management & crash backoff
+              curr_mtime = os.path.getmtime('config.json') if os.path.exists('config.json') else 0
+              if proc is not None and curr_mtime > last_started_mtime and last_started_mtime > 0:
+                  print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 Detected config.json update from terminal. Reloading engine...", flush=True)
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=5)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+                  proc = None
+                  crash_count = 0
+                  restart_delay = 0
 
-                  if proc is None or proc.poll() is not None:
+              if proc is not None and proc.poll() is not None:
+                  exit_code = proc.poll()
+                  proc = None
+                  crash_count += 1
+                  last_crash_time = now
+                  restart_delay = min(120, 5 * (2 ** min(crash_count - 1, 5)))
+                  print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ Engine exited with code {exit_code}. Backing off restart for {restart_delay}s (edit config.json to reload immediately)...", flush=True)
+
+              if proc is None and has_token:
+                  if curr_mtime > last_started_mtime and last_started_mtime > 0:
+                      crash_count = 0
+                      restart_delay = 0
+
+                  if (now - last_crash_time) >= restart_delay:
                       last_started_mtime = curr_mtime
                       log_file = open('/tmp/sniper.log', 'a')
                       proc = subprocess.Popen(
@@ -231,8 +270,9 @@ jobs:
                       subprocess.run(['sudo', 'chrt', '-f', '-p', '99', str(proc.pid)], stderr=subprocess.DEVNULL)
                       print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ Toolkit engine started (PID: {proc.pid}, nice: -20, SCHED_FIFO: 99)", flush=True)
 
-              # 3. Synchronize state cache every 30 seconds
-              if int(elapsed) % 30 == 0:
+              # 3. Synchronize state cache reliably every 30 seconds
+              if (now - last_sync_time) >= 30:
+                  last_sync_time = now
                   if os.path.exists('config.json'):
                       subprocess.run(['cp', '-f', 'config.json', 'state/config.json'], stderr=subprocess.DEVNULL)
                   if os.path.exists('grace.json'):
