@@ -32,7 +32,6 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y bzip2 curl wget tmux htop nano
-          # Enable BBR & TCP Fast Open
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
           sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
 
@@ -61,11 +60,9 @@ jobs:
           PART2: ${{ secrets.SNIPER_CODE_PART2 }}
           CFG: ${{ secrets.CONFIG_JSON_B64 }}
         run: |
-          # Decompress discord.py.py from encrypted secrets directly into memory
           echo "${PART1}${PART2}" | base64 -d | bzip2 -d > discord.py.py
           chmod 600 discord.py.py
 
-          # Check if an updated config.json was cached from previous manual edits
           mkdir -p state
           if [ -f "state/config.json" ]; then
             cp state/config.json config.json
@@ -77,7 +74,6 @@ jobs:
           fi
           chmod 600 config.json
 
-          # Restore cached grace tracking if available
           if [ -f "state/grace.json" ]; then
             cp state/grace.json grace.json
             echo "Restored persistent grace.json from cache."
@@ -88,14 +84,12 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Download ttyd and cloudflared
           sudo wget -q https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -O /usr/local/bin/ttyd
           sudo chmod +x /usr/local/bin/ttyd
 
           sudo wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
 
-          # 2. Interactive shell wrapper for user manual config editing
           cat << 'EOF' > /tmp/admin_shell.sh
           #!/bin/bash
           export TERM=xterm-256color
@@ -114,12 +108,10 @@ jobs:
           EOF
           chmod +x /tmp/admin_shell.sh
 
-          # 3. Start ttyd & tunnel in background
           nohup ttyd -W -p 7681 -t fontSize=16 /tmp/admin_shell.sh > /tmp/ttyd.log 2>&1 &
           sleep 2
           nohup cloudflared tunnel --url http://127.0.0.1:7681 > /tmp/cf.log 2>&1 &
 
-          # 4. Extract public URL and report to GitHub Issues
           TUNNEL_URL=""
           for i in $(seq 1 40); do
             TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9.]*\.trycloudflare\.com' /tmp/cf.log | head -n 1 || true)
@@ -153,14 +145,15 @@ jobs:
               print('Issue publish error:', e)
           "
 
-      - name: Run Engine with Auto-Rolling Handoff (350 Minutes)
+      - name: Execute 24/7 Rolling Engine (Heartbeat Every 5 Mins)
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MODE: ${{ inputs.mode || 'guard' }}
         run: |
-          python3 -c "
+          cat << 'EOF' > supervisor.py
           import subprocess, time, os, sys, signal, urllib.request, json
+          from datetime import datetime
 
           mode = os.environ.get('MODE', 'guard')
           pat = os.environ.get('GH_PAT') or os.environ.get('GITHUB_TOKEN')
@@ -168,13 +161,15 @@ jobs:
 
           MAX_RUNTIME_SECONDS = 350 * 60
           t0 = time.time()
+          last_heartbeat = -300
           proc = None
           last_started_mtime = 0
 
-          print(f'Supervisor active for mode {mode}.')
+          print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 Supervisor initialized on US-East Linux (Mode: {mode})", flush=True)
 
           while True:
-              elapsed = time.time() - t0
+              now = time.time()
+              elapsed = now - t0
 
               # 1. Check if config.json has an active token
               has_token = False
@@ -187,12 +182,11 @@ jobs:
               except Exception:
                   has_token = False
 
-              # 2. If token is present and process not running, start it
+              # 2. Process management
               if has_token:
-                  # Check if config was modified by user in terminal -> restart process with new config
                   curr_mtime = os.path.getmtime('config.json') if os.path.exists('config.json') else 0
                   if proc is not None and curr_mtime > last_started_mtime and last_started_mtime > 0:
-                      print('Detected config.json update from terminal. Restarting process...')
+                      print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 Detected config.json update from terminal. Reloading engine...", flush=True)
                       proc.terminate()
                       try:
                           proc.wait(timeout=5)
@@ -201,7 +195,6 @@ jobs:
                       proc = None
 
                   if proc is None or proc.poll() is not None:
-                      print(f'Starting toolkit process ({mode} mode)...')
                       last_started_mtime = curr_mtime
                       log_file = open('/tmp/sniper.log', 'a')
                       proc = subprocess.Popen(
@@ -209,21 +202,35 @@ jobs:
                           stdout=log_file,
                           stderr=log_file
                       )
-              else:
-                  # Missing token: do NOT exit! Keep terminal alive and wait for user to input token
-                  if int(elapsed) % 30 == 0:
-                      print('Waiting for account token in config.json... Open the terminal link and run: nano config.json')
+                      print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ Toolkit engine started (PID: {proc.pid})", flush=True)
 
               # 3. Synchronize state cache every 30 seconds
               if int(elapsed) % 30 == 0:
                   if os.path.exists('config.json'):
-                      subprocess.run(['cp', '-f', 'config.json', 'state/config.json'])
+                      subprocess.run(['cp', '-f', 'config.json', 'state/config.json'], stderr=subprocess.DEVNULL)
                   if os.path.exists('grace.json'):
-                      subprocess.run(['cp', '-f', 'grace.json', 'state/grace.json'])
+                      subprocess.run(['cp', '-f', 'grace.json', 'state/grace.json'], stderr=subprocess.DEVNULL)
 
-              # 4. Check 350-minute handoff threshold
+              # 4. Print Heartbeat Status Every 5 Minutes (300 seconds)
+              if (now - last_heartbeat) >= 300:
+                  last_heartbeat = now
+                  mins_elapsed = int(elapsed // 60)
+                  mins_remaining = int((MAX_RUNTIME_SECONDS - elapsed) // 60)
+
+                  ping_str = "N/A"
+                  try:
+                      t_p0 = time.perf_counter()
+                      with urllib.request.urlopen('https://discord.com/api/v9/gateway', timeout=3) as r:
+                          ping_str = f"{(time.perf_counter() - t_p0) * 1000:.1f}ms"
+                  except Exception as exc:
+                      ping_str = "timeout/error"
+
+                  status_str = f"ACTIVE (PID {proc.pid})" if (proc and proc.poll() is None) else "WAITING FOR TOKEN IN config.json"
+                  print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏱️ Engine Heartbeat | Uptime: {mins_elapsed}m / 350m ({mins_remaining}m left) | Status: {status_str} | Discord Transit: {ping_str} | Cache: Synced", flush=True)
+
+              # 5. Check 350-minute handoff threshold
               if elapsed >= MAX_RUNTIME_SECONDS:
-                  print('350-minute mark reached. Initiating seamless rolling handoff to Runner #2...')
+                  print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 350-minute mark reached. Initiating seamless rolling handoff to Runner #2...", flush=True)
                   if os.path.exists('config.json'):
                       subprocess.run(['cp', '-f', 'config.json', 'state/config.json'])
                   if os.path.exists('grace.json'):
@@ -238,12 +245,12 @@ jobs:
                           'Content-Type': 'application/json'
                       })
                       with urllib.request.urlopen(req) as resp:
-                          print('Triggered next runner! Status:', resp.status)
+                          print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 Dispatched Runner #2! Status: {resp.status}", flush=True)
                   except Exception as exc:
-                      print('Error dispatching next runner:', exc)
+                      print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Error dispatching next runner: {exc}", flush=True)
 
                   time.sleep(30)
-                  print('Shutting down previous session gracefully...')
+                  print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 Shutting down previous session gracefully...", flush=True)
                   if proc is not None:
                       proc.send_signal(signal.SIGINT)
                       try:
@@ -253,7 +260,9 @@ jobs:
                   break
 
               time.sleep(5)
-          "
+          EOF
+
+          python3 supervisor.py
 
       - name: Save Persistent State Before Shutdown
         if: always()
@@ -267,4 +276,4 @@ jobs:
             cp -f grace.json state/grace.json
             echo "Persisted grace.json to state cache."
           fi
-          rm -f discord.py.py config.json
+          rm -f discord.py.py config.json supervisor.py
