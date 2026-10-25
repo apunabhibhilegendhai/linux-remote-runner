@@ -1,10 +1,10 @@
-name: "Discord Vanity 24/7 Rolling Engine"
+name: "Discord Vanity Rolling Engine"
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Toolkit Mode (guard, sniper, grace, swap)"
+        description: "Toolkit mode (guard, sniper, grace, swap)"
         required: true
         default: "guard"
         type: choice
@@ -14,10 +14,17 @@ on:
           - grace
           - swap
 
+# The default token only needs to read the repo and dispatch the next rolling
+# run.  Do not grant contents: write: the engine never pushes code.
 permissions:
   actions: write
-  contents: write
-  issues: write
+  contents: read
+
+# Serialize runs so two engines never fight over the same vanity.  A handoff
+# dispatched near the end of a run waits here until the old job exits.
+concurrency:
+  group: vanity-engine
+  cancel-in-progress: false
 
 jobs:
   engine-session:
@@ -25,66 +32,55 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout Repository Skeleton
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Optimize Linux Kernel & Network Stack (BBR & Fast Open)
+      - name: Tune Linux network stack
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y bzip2 curl wget tmux htop nano ethtool util-linux || true
-          # Pin lowest-latency 5.2ms Anycast IP to eliminate DNS resolution jitter
-          sudo sed -i '/discord/d' /etc/hosts
-          sudo tee -a /etc/hosts << 'EOF'
-          162.159.135.232 discord.com
-          162.159.135.232 gateway.discord.gg
-          162.159.135.232 status.discord.com
-          162.159.135.232 cdn.discordapp.com
-          EOF
+          set -euo pipefail
+
+          # Do NOT pin /etc/hosts.  Discord anycast is measured at runtime by
+          # the engine (DNSPreResolver); a hard-coded edge can be the slow one.
+          for pkg in bzip2 ethtool; do
+            command -v "$pkg" >/dev/null 2>&1 || sudo apt-get install -y "$pkg" || true
+          done
+
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sudo sysctl -w net.core.default_qdisc=fq || true
           sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
           sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0 || true
           sudo sysctl -w net.ipv4.tcp_notsent_lowat=1024 || true
           sudo sysctl -w net.ipv4.tcp_tw_reuse=1 || true
-          sudo sysctl -w net.ipv4.tcp_low_latency=1 || true
-          sudo sysctl -w net.ipv4.tcp_adv_win_scale=2 || true
           sudo sysctl -w net.ipv4.tcp_no_metrics_save=1 || true
-          sudo sysctl -w net.core.busy_read=100 || true
-          sudo sysctl -w net.core.busy_poll=100 || true
+          sudo sysctl -w net.ipv4.tcp_autocorking=0 || true
+          sudo sysctl -w net.ipv4.tcp_fin_timeout=10 || true
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" || true
           sudo sysctl -w net.core.rmem_max=33554432 || true
           sudo sysctl -w net.core.wmem_max=33554432 || true
           sudo sysctl -w net.core.rmem_default=8388608 || true
           sudo sysctl -w net.core.wmem_default=8388608 || true
-          sudo sysctl -w net.core.default_qdisc=fq || true
           sudo sysctl -w net.core.netdev_max_backlog=65536 || true
           sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65536 || true
-          sudo sysctl -w net.ipv4.tcp_autocorking=0 || true
-          sudo sysctl -w net.ipv4.tcp_sack=1 || true
-          sudo sysctl -w net.ipv4.tcp_dsack=1 || true
-          sudo sysctl -w net.ipv4.tcp_timestamps=1 || true
-          sudo sysctl -w net.ipv4.tcp_window_scaling=1 || true
-          sudo sysctl -w net.ipv4.tcp_fin_timeout=10 || true
-          # Zero-latency physical NIC ring buffer and interrupt coalescing bypass
-          IFACE=$(ip route show default | awk '{print $5}')
+
+          IFACE=$(ip route show default | awk '{print $5}' | head -n 1)
           if [ -n "$IFACE" ]; then
             sudo ethtool -G "$IFACE" rx 4096 tx 4096 || true
             sudo ethtool -C "$IFACE" adaptive-rx off rx-usecs 0 rx-frames 1 || true
           fi
-          # Modern Linux 6.x low-latency TCP stack tuning
-          sudo sysctl -w net.ipv4.tcp_early_retrans=3 || true
-          sudo sysctl -w net.ipv4.tcp_recovery=1 || true
-          sudo sysctl -w net.ipv4.tcp_thin_linear_timeouts=1 || true
-          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" || true
-          # Lock CPU Governor to performance to eliminate frequency downscaling jitter
+
           for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-            echo performance | sudo tee "$g" >/dev/null 2>&1 || true
+            [ -e "$g" ] && echo performance | sudo tee "$g" >/dev/null 2>&1 || true
           done
 
-      - name: Restore Persistent State (configs, grace.json & progress)
-        uses: actions/cache@v4
+      - name: Restore grace state
+        uses: actions/cache/restore@v4
         with:
-          path: state/
-          key: vanity-state-${{ github.run_id }}
-          restore-keys: vanity-state-
+          path: state
+          key: vanity-grace-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            vanity-grace-
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
@@ -92,265 +88,395 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Install Runtime Dependencies & uvloop
+      - name: Install runtime dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install uvloop
 
-      - name: Zero-Exposure In-Memory Code & Config Restoration
+      - name: Restore engine code and config from secrets
         env:
           PART1: ${{ secrets.SNIPER_CODE_PART1 }}
           PART2: ${{ secrets.SNIPER_CODE_PART2 }}
+          PART3: ${{ secrets.SNIPER_CODE_PART3 }}
+          PART4: ${{ secrets.SNIPER_CODE_PART4 }}
           CFG: ${{ secrets.CONFIG_JSON_B64 }}
         run: |
-          if [ -n "${PART1}" ]; then
-            echo "${PART1}${PART2}" | base64 -d | bzip2 -d > discord.py.py
-            echo "Loaded encrypted discord.py.py from secrets."
-          else
-            echo "Using repository discord.py.py."
-          fi
-          chmod 600 discord.py.py
+          set -euo pipefail
+          umask 077
 
-          mkdir -p state
-          if [ -f "state/config.json" ] && ! grep -q '"token": ""' state/config.json && ! grep -q '"sniper_token": ""' state/config.json && ! grep -q 'YOUR_.*TOKEN' state/config.json; then
-            cp state/config.json config.json
-            echo "Loaded user-updated config.json from cache."
-          elif [ -n "${CFG}" ]; then
-            echo "${CFG}" | base64 -d > config.json
-            cp config.json state/config.json
-            echo "Loaded valid config.json from secrets."
-          elif [ -f "config.json" ]; then
-            cp config.json state/config.json
-            echo "Loaded config.json from repository."
-          fi
-          chmod 600 config.json
-
-          if [ -f "state/grace.json" ]; then
-            cp state/grace.json grace.json
-            echo "Restored persistent grace.json from cache."
+          if [ -n "${PART1:-}" ]; then
+            printf '%s' "${PART1}${PART2:-}${PART3:-}${PART4:-}" | base64 -d | bzip2 -dc > discord.py.py
+            echo "Loaded discord.py.py from repository secrets."
           fi
 
-      - name: Setup Background Admin Terminal (ttyd & Cloudflare Tunnel)
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          sudo wget -q https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -O /usr/local/bin/ttyd
-          sudo chmod +x /usr/local/bin/ttyd
+          if [ ! -s discord.py.py ]; then
+            echo "::error::discord.py.py is missing. Set SNIPER_CODE_PART1/SNIPER_CODE_PART2/SNIPER_CODE_PART3 or add the engine file to the repo."
+            exit 1
+          fi
+          python -m py_compile discord.py.py
 
-          sudo wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
-          sudo chmod +x /usr/local/bin/cloudflared
+          if [ -n "${CFG:-}" ]; then
+            printf '%s' "${CFG}" | base64 -d > config.json
+          fi
 
-          cat << 'EOF' > /tmp/admin_shell.sh
-          #!/bin/bash
-          export TERM=xterm-256color
-          export HOME=/home/runner
-          export USER=runner
-          cd /home/runner/work/linux-remote-runner/linux-remote-runner
-          clear
-          echo "=========================================================="
-          echo "⚡ DISCORD VANITY ADMIN TERMINAL (US-EAST / AZURE)"
-          echo "To edit your token/guilds: nano config.json"
-          echo "To watch live logs: tail -f /tmp/sniper.log"
-          echo "To restart sniper manually: pkill -f discord.py.py"
-          echo "=========================================================="
-          echo ""
-          exec /bin/bash -i
-          EOF
-          chmod +x /tmp/admin_shell.sh
+          if [ ! -s config.json ]; then
+            echo "::error::config.json is missing. Set the CONFIG_JSON_B64 repository secret."
+            exit 1
+          fi
+          chmod 600 discord.py.py config.json
 
-          nohup ttyd -W -p 7681 -t fontSize=16 /tmp/admin_shell.sh > /tmp/ttyd.log 2>&1 &
-          sleep 2
-          nohup cloudflared tunnel --url http://127.0.0.1:7681 > /tmp/cf.log 2>&1 &
+          # Validate without ever printing a token.
+          python - <<'PY'
+          import json
+          import sys
 
-          TUNNEL_URL=""
-          for i in $(seq 1 40); do
-            TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9.]*\.trycloudflare\.com' /tmp/cf.log | head -n 1 || true)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "Admin Config Terminal is LIVE: $TUNNEL_URL"
-              break
-            fi
-            sleep 1
-          done
-
-          python3 -c "
-          import urllib.request, json, os, sys
-          tok = os.environ.get('GH_PAT') or os.environ.get('GITHUB_TOKEN')
-          repo = os.environ.get('GITHUB_REPOSITORY')
-          url = '$TUNNEL_URL'
-
-          if not url or 'trycloudflare.com' not in url:
-              print('No active Cloudflare tunnel URL detected; skipping issue creation.')
-              sys.exit(0)
-
-          issue_data = json.dumps({
-              'title': 'LIVE_ADMIN_TERMINAL_URL',
-              'body': f'### ⚡ Admin Terminal Online\n\n**Direct Terminal Link:** {url}\n\n- Edit config: \`nano config.json\`\n- Watch live logs: \`tail -f /tmp/sniper.log\`\n\nEdits to \`config.json\` automatically sync to cache every 30 seconds.'
-          }).encode()
-
-          req_issue = urllib.request.Request(f'https://api.github.com/repos/{repo}/issues', data=issue_data, headers={
-              'Authorization': f'token {tok}',
-              'User-Agent': 'Python',
-              'Content-Type': 'application/json'
-          })
           try:
-              urllib.request.urlopen(req_issue)
-              print('Admin terminal link published to GitHub Issues!')
-          except Exception as e:
-              print('Issue publish error:', e)
-          "
+              with open("config.json", "r", encoding="utf-8") as fh:
+                  cfg = json.load(fh)
+          except Exception as exc:
+              print(f"::error::config.json is not valid JSON ({type(exc).__name__})")
+              sys.exit(1)
 
-      - name: Execute 24/7 Rolling Engine (Heartbeat Every 5 Mins)
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MODE: ${{ inputs.mode || 'guard' }}
+          def usable(key):
+              value = str(cfg.get(key) or "").strip()
+              return bool(value) and not value.startswith("YOUR_")
+
+          if not any(usable(k) for k in ("token", "sniper_token", "monitor_token")):
+              print("::error::config.json contains no usable Discord token")
+              sys.exit(1)
+          print("Config validated.")
+          PY
+
+      - name: Restore grace state file
         run: |
-          cat << 'EOF' > supervisor.py
-          import subprocess, time, os, sys, signal, urllib.request, json
-          from datetime import datetime
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
 
-          mode = os.environ.get('MODE', 'guard')
-          pat = os.environ.get('GH_PAT') or os.environ.get('GITHUB_TOKEN')
-          repo = os.environ.get('GITHUB_REPOSITORY')
+          try:
+              with open("config.json", "r", encoding="utf-8") as fh:
+                  cfg = json.load(fh)
+          except Exception:
+              cfg = {}
+
+          raw = str(cfg.get("grace_file") or "grace.json").strip() or "grace.json"
+          target = os.path.abspath(os.path.expanduser(raw))
+          cached = os.path.join("state", os.path.basename(target))
+          if os.path.isfile(cached):
+              parent = os.path.dirname(target)
+              if parent:
+                  os.makedirs(parent, exist_ok=True)
+              if os.path.abspath(cached) != os.path.abspath(target):
+                  shutil.copyfile(cached, target)
+              print(f"Restored grace state to {raw} from cache.")
+          else:
+              print(f"No cached grace state for {raw}; starting fresh.")
+          PY
+
+      - name: Run rolling engine supervisor
+        env:
+          MODE: ${{ inputs.mode || 'guard' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          cat > supervisor.py <<'PY'
+          import json
+          import os
+          import signal
+          import subprocess
+          import sys
+          import time
+          import urllib.request
+          from datetime import datetime, timezone
+
+          MODE = os.environ.get("MODE", "guard")
+          REPO = os.environ.get("GITHUB_REPOSITORY", "")
+          REF = os.environ.get("GITHUB_REF_NAME", "main")
+          TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
           MAX_RUNTIME_SECONDS = 350 * 60
-          t0 = time.time()
-          last_heartbeat = -300
-          last_sync_time = 0
-          crash_count = 0
-          last_crash_time = 0
-          restart_delay = 0
-          proc = None
-          last_started_mtime = 0
+          HEARTBEAT_SECONDS = 300
+          SYNC_SECONDS = 30
+          ONE_SHOT = MODE in ("swap", "instant", "claim")
 
-          print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 Supervisor initialized on US-East Linux (Mode: {mode})", flush=True)
+          # Never inherit the supervisor's secrets.  The engine only needs the
+          # runtime environment and any proxy settings it is explicitly given.
+          ALLOWED_ENV = (
+              "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
+              "SSL_CERT_FILE", "SSL_CERT_DIR",
+              "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+              "http_proxy", "https_proxy", "no_proxy",
+          )
 
-          while True:
-              now = time.time()
-              elapsed = now - t0
 
-              # 1. Check if config.json has an active token
-              has_token = False
+          def log(message):
+              stamp = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+              print(f"[{stamp}] {message}", flush=True)
+
+
+          def load_config():
               try:
-                  if os.path.exists('config.json'):
-                      with open('config.json', 'r') as f:
-                          cfg = json.load(f)
-                      tok = cfg.get('token') or cfg.get('sniper_token')
-                      has_token = bool(tok and str(tok).strip() and not str(tok).strip().startswith('YOUR_'))
+                  with open("config.json", "r", encoding="utf-8") as fh:
+                      return json.load(fh)
               except Exception:
-                  has_token = False
+                  return {}
 
-              # 2. Process management & crash backoff
-              curr_mtime = os.path.getmtime('config.json') if os.path.exists('config.json') else 0
-              if proc is not None and curr_mtime > last_started_mtime and last_started_mtime > 0:
-                  print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 Detected config.json update from terminal. Reloading engine...", flush=True)
-                  proc.terminate()
+
+          def has_token(cfg):
+              for key in ("token", "sniper_token", "monitor_token"):
+                  value = str(cfg.get(key) or "").strip()
+                  if value and not value.startswith("YOUR_"):
+                      return True
+              return False
+
+
+          def child_env():
+              env = {key: os.environ[key] for key in ALLOWED_ENV if key in os.environ}
+              env["PYTHONUNBUFFERED"] = "1"
+              env["PYTHONDONTWRITEBYTECODE"] = "1"
+              return env
+
+
+          def grace_file_path():
+              cfg = load_config()
+              raw = str(cfg.get("grace_file") or "grace.json").strip() or "grace.json"
+              return os.path.abspath(os.path.expanduser(raw))
+
+
+          def sync_state():
+              try:
+                  os.makedirs("state", exist_ok=True)
+                  src_path = grace_file_path()
+                  if os.path.exists(src_path):
+                      name = os.path.basename(src_path) or "grace.json"
+                      tmp = os.path.join("state", name + ".tmp")
+                      with open(src_path, "rb") as src, open(tmp, "wb") as dst:
+                          dst.write(src.read())
+                      os.replace(tmp, os.path.join("state", name))
+              except Exception as exc:
+                  log(f"state sync failed: {exc}")
+
+
+          def dispatch_next():
+              if not REPO or not TOKEN:
+                  log("handoff skipped: missing repository or token")
+                  return False
+              url = f"https://api.github.com/repos/{REPO}/actions/workflows/sniper.yml/dispatches"
+              payload = json.dumps({"ref": REF, "inputs": {"mode": MODE}}).encode()
+              headers = {
+                  "Authorization": f"Bearer {TOKEN}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "vanity-rolling-dispatcher",
+                  "Content-Type": "application/json",
+              }
+              for attempt in range(1, 4):
+                  try:
+                      request = urllib.request.Request(url, data=payload, headers=headers)
+                      with urllib.request.urlopen(request, timeout=15) as response:
+                          log(f"handoff dispatched (HTTP {response.status})")
+                          return True
+                  except Exception as exc:
+                      log(f"handoff attempt {attempt}/3 failed: {exc}")
+                      time.sleep(5 * attempt)
+              return False
+
+
+          def start_engine():
+              return subprocess.Popen(
+                  [sys.executable, "-u", "discord.py.py", MODE],
+                  cwd=os.getcwd(),
+                  env=child_env(),
+              )
+
+
+          def stop_engine(proc):
+              if proc is None or proc.poll() is not None:
+                  return
+              try:
+                  proc.send_signal(signal.SIGINT)
+                  proc.wait(timeout=10)
+              except subprocess.TimeoutExpired:
+                  proc.kill()
                   try:
                       proc.wait(timeout=5)
                   except subprocess.TimeoutExpired:
+                      pass
+              except Exception:
+                  try:
                       proc.kill()
-                  proc = None
-                  crash_count = 0
-                  restart_delay = 0
+                  except Exception:
+                      pass
 
-              if proc is not None and proc.poll() is not None:
-                  exit_code = proc.poll()
-                  proc = None
-                  crash_count += 1
-                  last_crash_time = now
-                  restart_delay = min(120, 5 * (2 ** min(crash_count - 1, 5)))
-                  print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ Engine exited with code {exit_code}. Backing off restart for {restart_delay}s (edit config.json to reload immediately)...", flush=True)
 
-              if proc is None and has_token:
-                  if curr_mtime > last_started_mtime and last_started_mtime > 0:
-                      crash_count = 0
-                      restart_delay = 0
-
-                  if (now - last_crash_time) >= restart_delay:
-                      last_started_mtime = curr_mtime
-                      log_file = open('/tmp/sniper.log', 'a')
-                      proc = subprocess.Popen(
-                          ['taskset', '-c', '1', sys.executable, '-u', 'discord.py.py', mode],
-                          stdout=log_file,
-                          stderr=log_file
+          def heartbeat(proc, elapsed, last_ping):
+              status = f"ACTIVE (PID {proc.pid})" if proc and proc.poll() is None else "RESTARTING"
+              ping = "n/a"
+              if time.time() - last_ping >= HEARTBEAT_SECONDS:
+                  try:
+                      request = urllib.request.Request(
+                          "https://discord.com/api/v10/gateway", method="HEAD"
                       )
-                      subprocess.run(['sudo', 'renice', '-n', '-20', '-p', str(proc.pid)], stderr=subprocess.DEVNULL)
-                      subprocess.run(['sudo', 'chrt', '-f', '-p', '99', str(proc.pid)], stderr=subprocess.DEVNULL)
-                      print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ Toolkit engine started (PID: {proc.pid}, nice: -20, SCHED_FIFO: 99, CPU Core 1)", flush=True)
+                      start = time.perf_counter()
+                      with urllib.request.urlopen(request, timeout=3):
+                          ping = f"{(time.perf_counter() - start) * 1000:.1f}ms"
+                  except Exception:
+                      ping = "timeout/error"
+              log(
+                  f"heartbeat | mode={MODE} | uptime={int(elapsed // 60)}m/"
+                  f"{MAX_RUNTIME_SECONDS // 60}m | {status} | Discord={ping}"
+              )
 
-              # 3. Synchronize state cache reliably every 30 seconds
-              if (now - last_sync_time) >= 30:
-                  last_sync_time = now
-                  if os.path.exists('config.json'):
-                      subprocess.run(['cp', '-f', 'config.json', 'state/config.json'], stderr=subprocess.DEVNULL)
-                  if os.path.exists('grace.json'):
-                      subprocess.run(['cp', '-f', 'grace.json', 'state/grace.json'], stderr=subprocess.DEVNULL)
 
-              # 4. Print Heartbeat Status Every 5 Minutes (300 seconds)
-              if (now - last_heartbeat) >= 300:
-                  last_heartbeat = now
-                  mins_elapsed = int(elapsed // 60)
-                  mins_remaining = int((MAX_RUNTIME_SECONDS - elapsed) // 60)
+          def main():
+              cfg = load_config()
+              if not has_token(cfg):
+                  log("no usable token in config.json; refusing to idle")
+                  return 1
 
-                  ping_str = "N/A"
-                  try:
-                      t_p0 = time.perf_counter()
-                      with urllib.request.urlopen('https://discord.com/api/v9/gateway', timeout=3) as r:
-                          ping_str = f"{(time.perf_counter() - t_p0) * 1000:.1f}ms"
-                  except Exception as exc:
-                      ping_str = "timeout/error"
+              sync_state()
 
-                  status_str = f"ACTIVE (PID {proc.pid})" if (proc and proc.poll() is None) else "WAITING FOR TOKEN IN config.json"
-                  print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏱️ Engine Heartbeat | Uptime: {mins_elapsed}m / 350m ({mins_remaining}m left) | Status: {status_str} | Discord Transit: {ping_str} | Cache: Synced", flush=True)
+              if ONE_SHOT:
+                  log(f"one-shot mode={MODE}; running once")
+                  proc = start_engine()
+                  code = proc.wait()
+                  sync_state()
+                  log(f"one-shot engine exited with code {code}")
+                  return code
 
-              # 5. Check 350-minute handoff threshold
-              if elapsed >= MAX_RUNTIME_SECONDS:
-                  print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 350-minute mark reached. Initiating seamless rolling handoff to Runner #2...", flush=True)
-                  if os.path.exists('config.json'):
-                      subprocess.run(['cp', '-f', 'config.json', 'state/config.json'])
-                  if os.path.exists('grace.json'):
-                      subprocess.run(['cp', '-f', 'grace.json', 'state/grace.json'])
+              log(f"supervisor started | mode={MODE} | ref={REF}")
 
-                  try:
-                      url = f'https://api.github.com/repos/{repo}/actions/workflows/sniper.yml/dispatches'
-                      payload = json.dumps({'ref': 'main', 'inputs': {'mode': mode}}).encode()
-                      req = urllib.request.Request(url, data=payload, headers={
-                          'Authorization': f'token {pat}',
-                          'User-Agent': 'Rolling-Dispatcher',
-                          'Content-Type': 'application/json'
-                      })
-                      with urllib.request.urlopen(req) as resp:
-                          print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 Dispatched Runner #2! Status: {resp.status}", flush=True)
-                  except Exception as exc:
-                      print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Error dispatching next runner: {exc}", flush=True)
+              started = time.time()
+              last_heartbeat = -HEARTBEAT_SECONDS
+              last_ping = -HEARTBEAT_SECONDS
+              last_sync = 0.0
+              crash_count = 0
+              last_crash = 0.0
+              restart_delay = 0.0
+              engine_started_at = 0.0
+              proc = None
 
-                  time.sleep(30)
-                  print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 Shutting down previous session gracefully...", flush=True)
-                  if proc is not None:
-                      proc.send_signal(signal.SIGINT)
-                      try:
-                          proc.wait(timeout=10)
-                      except subprocess.TimeoutExpired:
-                          proc.kill()
-                  break
+              try:
+                  while True:
+                      now = time.time()
+                      elapsed = now - started
 
-              time.sleep(5)
-          EOF
+                      if proc is not None and proc.poll() is None:
+                          if engine_started_at and (now - engine_started_at) >= 60.0:
+                              if crash_count:
+                                  log("engine healthy for 60s; resetting crash backoff")
+                                  crash_count = 0
+                              engine_started_at = now
+
+                      if proc is not None and proc.poll() is not None:
+                          exit_code = proc.returncode
+                          proc = None
+                          engine_started_at = 0.0
+                          crash_count += 1
+                          last_crash = now
+                          restart_delay = min(120.0, 5.0 * (2 ** min(crash_count - 1, 5)))
+                          log(
+                              f"engine exited with code {exit_code}; "
+                              f"restart in {restart_delay:.0f}s"
+                          )
+
+                      if proc is None and (now - last_crash) >= restart_delay:
+                          proc = start_engine()
+                          engine_started_at = now
+                          log(f"engine started (PID {proc.pid})")
+
+                      if now - last_sync >= SYNC_SECONDS:
+                          last_sync = now
+                          sync_state()
+
+                      if now - last_heartbeat >= HEARTBEAT_SECONDS:
+                          last_heartbeat = now
+                          heartbeat(proc, elapsed, last_ping)
+                          last_ping = now
+
+                      if elapsed >= MAX_RUNTIME_SECONDS:
+                          log("runtime limit reached; dispatching handoff")
+                          sync_state()
+                          dispatched = dispatch_next()
+                          if not dispatched:
+                              log("handoff failed; exiting without a successor")
+                          time.sleep(30)
+                          stop_engine(proc)
+                          proc = None
+                          break
+
+                      time.sleep(2)
+              finally:
+                  stop_engine(proc)
+                  sync_state()
+
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
 
           python3 supervisor.py
 
-      - name: Save Persistent State Before Shutdown
+      - name: Prepare state for cache
         if: always()
         run: |
-          mkdir -p state
-          if [ -f "config.json" ]; then
-            cp -f config.json state/config.json
-            echo "Persisted config.json to state cache."
-          fi
-          if [ -f "grace.json" ]; then
-            cp -f grace.json state/grace.json
-            echo "Persisted grace.json to state cache."
-          fi
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+
+          os.makedirs("state", exist_ok=True)
+          try:
+              with open("config.json", "r", encoding="utf-8") as fh:
+                  cfg = json.load(fh)
+          except Exception:
+              cfg = {}
+
+          raw = str(cfg.get("grace_file") or "grace.json").strip() or "grace.json"
+          src = os.path.abspath(os.path.expanduser(raw))
+          name = os.path.basename(src) or "grace.json"
+          dst = os.path.join("state", name)
+          if os.path.isfile(src):
+              if os.path.abspath(src) != os.path.abspath(dst):
+                  shutil.copyfile(src, dst)
+          elif not os.path.exists(dst):
+              with open(dst, "w", encoding="utf-8") as fh:
+                  fh.write("{}")
+          PY
+
+      - name: Save grace state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: vanity-grace-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Remove secrets from workspace
+        if: always()
+        run: |
+          set +e
+          python3 - <<'PY'
+          import json
+          import os
+
+          try:
+              with open("config.json", "r", encoding="utf-8") as fh:
+                  cfg = json.load(fh)
+          except Exception:
+              cfg = {}
+
+          raw = str(cfg.get("grace_file") or "grace.json").strip() or "grace.json"
+          try:
+              os.remove(os.path.abspath(os.path.expanduser(raw)))
+          except OSError:
+              pass
+          PY
           rm -f discord.py.py config.json supervisor.py
+          rm -rf state

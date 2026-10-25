@@ -14,3 +14,14 @@ __pycache__/
 captures/
 venv/
 .env
+
+# Local backups, scratch work and proxy credentials
+*.bak
+*.backup
+*.audit_backup
+*.pre_fix*
+scratch/
+proxies.txt
+config.json.*
+grace.json.*
+live_config.json

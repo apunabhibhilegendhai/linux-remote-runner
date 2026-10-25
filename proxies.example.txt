@@ -1,0 +1,20 @@
+# ==============================================================================
+# PROXY MESH / DISTRIBUTED GRID POOL (proxies.txt)
+# ==============================================================================
+# Any standard proxy format is automatically recognized and normalized:
+# 
+# 1. Standard HTTP/HTTPS:
+# http://username:password@1.2.3.4:8080
+# http://1.2.3.4:8080
+#
+# 2. SOCKS5:
+# socks5://username:password@1.2.3.4:1080
+# socks5://1.2.3.4:1080
+#
+# 3. Raw Vendor Export (Webshare / BrightData / Proxy-Cheap):
+# 1.2.3.4:8080:username:password
+#
+# 4. Cloudflare Worker / Serverless Edge Reverse Proxy Gateway:
+# https://my-worker.subdomain.workers.dev
+#
+# Add your proxies below (one per line):
