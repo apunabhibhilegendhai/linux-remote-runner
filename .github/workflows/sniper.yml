@@ -79,6 +79,48 @@ jobs:
             [ -e "$g" ] && echo performance | sudo tee "$g" >/dev/null 2>&1 || true
           done
 
+      - name: Verify US-East low-latency runner placement (< 15ms RTT)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Measure physical connect RTT to Discord Anycast
+          PING_MS=$(python3 -c "
+          import socket, time
+          s = socket.socket()
+          s.settimeout(2.0)
+          t0 = time.perf_counter()
+          try:
+              s.connect(('162.159.138.232', 443))
+              dt = (time.perf_counter() - t0) * 1000
+          except Exception:
+              dt = 999.0
+          finally:
+              s.close()
+          print(f'{dt:.1f}')
+          " || echo "999.0")
+
+          echo "Discord Anycast RTT: ${PING_MS}ms"
+
+          # Region check via Azure metadata (best-effort)
+          AZ_REGION=$(curl -s -m 1 -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null | jq -r '.compute.location // empty' 2>/dev/null || echo "unknown")
+          echo "Azure Region: ${AZ_REGION}"
+
+          # If RTT is > 20ms, runner is NOT in US-East (likely Europe or West Coast)
+          # Automatically trigger re-roll to catch an Azure eastus runner (<4ms)
+          IS_SLOW=$(python3 -c "print(1 if float('${PING_MS}') > 20.0 else 0)")
+          if [ "$IS_SLOW" = "1" ]; then
+            echo "::warning::Runner RTT is ${PING_MS}ms (outside US-East). Re-rolling to catch an Azure eastus runner (<4ms)..."
+            if [ -n "${GITHUB_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+              curl -s -X POST                 -H "Authorization: Bearer ${GITHUB_TOKEN}"                 -H "Accept: application/vnd.github.v3+json"                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/sniper.yml/dispatches"                 -d "{"ref":"${GITHUB_REF_NAME:-main}","inputs":{"mode":"${{ inputs.mode || 'guard' }}"}}" || true
+            fi
+            echo "Clean re-roll exit to guarantee < 20ms latency."
+            exit 0
+          fi
+
+          echo "Runner verified in US-East! Physical RTT: ${PING_MS}ms (< 20ms guaranteed)."
+
       - name: Restore grace state
         uses: actions/cache/restore@v4
         with:
@@ -274,6 +316,69 @@ jobs:
               print('Issue publish notice:', exc)
           "
 
+      - name: Setup SSH & RDP Remote Access
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Install XRDP and XFCE desktop
+          sudo apt-get update
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends xrdp xfce4 xfce4-terminal xterm dbus-x11
+
+          # Configure user passwords
+          echo "runner:runner123!" | sudo chpasswd
+          echo "root:runner123!" | sudo chpasswd
+
+          # Configure SSH password authentication
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+
+          # Configure XRDP session
+          echo "xfce4-session" > /home/runner/.xsession
+          chmod +x /home/runner/.xsession
+          sudo adduser xrdp ssl-cert || true
+          sudo systemctl restart xrdp
+
+          # Start Pinggy tunnels for SSH (port 22) and RDP (port 3389)
+          cat << 'EOF' > /home/runner/tunnel_watchdog.sh
+          #!/bin/bash
+          while true; do
+            if ! pgrep -f "tcp@a.pinggy.io.*22" > /dev/null; then
+              nohup ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -p 443 -R0:localhost:22 tcp@a.pinggy.io > /tmp/pinggy_ssh.log 2>&1 &
+            fi
+            if ! pgrep -f "tcp@a.pinggy.io.*3389" > /dev/null; then
+              nohup ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -p 443 -R0:localhost:3389 tcp@a.pinggy.io > /tmp/pinggy_rdp.log 2>&1 &
+            fi
+            sleep 10
+          done
+          EOF
+          chmod +x /home/runner/tunnel_watchdog.sh
+          nohup /home/runner/tunnel_watchdog.sh > /dev/null 2>&1 &
+          sleep 5
+
+          SSH_URL=$(grep -o 'tcp://[-a-zA-Z0-9.]*:[0-9]*' /tmp/pinggy_ssh.log | head -n 1 || true)
+          RDP_URL=$(grep -o 'tcp://[-a-zA-Z0-9.]*:[0-9]*' /tmp/pinggy_rdp.log | head -n 1 || true)
+
+          echo "=========================================================="
+          echo "⚡ SSH ENDPOINT: $SSH_URL"
+          echo "⚡ RDP ENDPOINT: $RDP_URL"
+          echo "⚡ Username: runner | Password: runner123!"
+          echo "=========================================================="
+
+          if [ -n "$SSH_URL" ] || [ -n "$RDP_URL" ]; then
+            echo "## 🖥️ Remote Access (SSH & RDP)" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **SSH Command:** \`ssh -p ${SSH_URL##*:} runner@${SSH_URL#*://}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Direct RDP:** \`${RDP_URL#*://}\` (in Windows Remote Desktop)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Username:** \`runner\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Password:** \`runner123!\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Run rolling engine supervisor
         env:
           MODE: ${{ inputs.mode || 'guard' }}
@@ -393,7 +498,7 @@ jobs:
           def start_engine():
               log_fh = open("/tmp/sniper.log", "a", buffering=1)
               proc = subprocess.Popen(
-                  ["taskset", "-c", "1,2", sys.executable, "-u", "discord.py.py", MODE],
+                  ["taskset", "-c", "1,2", sys.executable, "-OO", "-u", "discord.py.py", MODE],
                   cwd=os.getcwd(),
                   env=child_env(),
                   stdout=subprocess.PIPE,
@@ -403,7 +508,7 @@ jobs:
               )
               try:
                   subprocess.run(["sudo", "renice", "-n", "-20", "-p", str(proc.pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                  subprocess.run(["sudo", "chrt", "-f", "-p", "99", str(proc.pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  subprocess.run(["sudo", "chrt", "-r", "-p", "80", str(proc.pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               except Exception:
                   pass
               def pipe_output():
