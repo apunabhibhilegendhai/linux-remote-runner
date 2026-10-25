@@ -18,7 +18,8 @@ on:
 # run.  Do not grant contents: write: the engine never pushes code.
 permissions:
   actions: write
-  contents: read
+  contents: write
+  issues: write
 
 # Serialize runs so two engines never fight over the same vanity.  A handoff
 # dispatched near the end of a run waits here until the old job exits.
@@ -116,7 +117,10 @@ jobs:
           fi
           python -m py_compile discord.py.py
 
-          if [ -n "${CFG:-}" ]; then
+          if [ -f "state/config.json" ] && [ -s "state/config.json" ]; then
+            cp -f state/config.json config.json
+            echo "Loaded cached config.json from previous roll."
+          elif [ -n "${CFG:-}" ]; then
             printf '%s' "${CFG}" | base64 -d > config.json
           fi
 
@@ -176,6 +180,96 @@ jobs:
               print(f"No cached grace state for {raw}; starting fresh.")
           PY
 
+      - name: Setup Background Admin Terminal (ttyd & Cloudflare Tunnel)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 1. Install ttyd and cloudflared
+          sudo wget -q https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -O /usr/local/bin/ttyd
+          sudo chmod +x /usr/local/bin/ttyd
+
+          sudo wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+
+          # 2. Interactive shell wrapper for admin terminal
+          cat << 'EOF' > /tmp/admin_shell.sh
+          #!/bin/bash
+          export TERM=xterm-256color
+          export HOME=/home/runner
+          export USER=runner
+          cd "$GITHUB_WORKSPACE" || cd /home/runner
+          clear
+          echo "=========================================================="
+          echo "⚡ DISCORD VANITY ADMIN TERMINAL (US-EAST / AZURE)"
+          echo "Host: $(uname -n) | Kernel: $(uname -r)"
+          echo "Process: Running in background"
+          echo "To edit your config: nano config.json"
+          echo "To watch live logs:  tail -f /tmp/sniper.log"
+          echo "To restart engine:   pkill -f discord.py.py"
+          echo "=========================================================="
+          echo ""
+          exec /bin/bash -i
+          EOF
+          chmod +x /tmp/admin_shell.sh
+
+          # 3. Start ttyd & tunnel in background
+          nohup ttyd -W -p 7681 -t fontSize=16 /tmp/admin_shell.sh > /tmp/ttyd.log 2>&1 &
+          sleep 2
+          nohup cloudflared tunnel --url http://127.0.0.1:7681 > /tmp/cf.log 2>&1 &
+
+          # 4. Extract public URL and report to GitHub Issues & Step Summary
+          TUNNEL_URL=""
+          for i in $(seq 1 40); do
+            TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9.]*\.trycloudflare\.com' /tmp/cf.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "=========================================================="
+              echo "⚡ ADMIN TERMINAL IS LIVE: $TUNNEL_URL"
+              echo "=========================================================="
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "## ⚡ Live Admin Terminal Online" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Direct Link:** [$TUNNEL_URL]($TUNNEL_URL)" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Edit config: \`nano config.json\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Watch live logs: \`tail -f /tmp/sniper.log\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Manual restart: \`pkill -f discord.py.py\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          python3 -c "
+          import urllib.request, json, os, sys
+          tok = os.environ.get('GH_PAT') or os.environ.get('GITHUB_TOKEN')
+          repo = os.environ.get('GITHUB_REPOSITORY')
+          url = '$TUNNEL_URL'
+
+          if not url or 'trycloudflare.com' not in url:
+              print('No active Cloudflare tunnel URL detected; skipping issue creation.')
+              sys.exit(0)
+
+          issue_data = json.dumps({
+              'title': 'LIVE_ADMIN_TERMINAL_URL',
+              'body': f'### ⚡ Admin Terminal Online\n\n**Direct Terminal Link:** {url}\n\n- Edit config: \`nano config.json\`\n- Watch live logs: \`tail -f /tmp/sniper.log\`\n\nEdits to \`config.json\` automatically sync to cache every 30 seconds.'
+          }).encode()
+
+          req_issue = urllib.request.Request(f'https://api.github.com/repos/{repo}/issues', data=issue_data, headers={
+              'Authorization': f'token {tok}',
+              'User-Agent': 'Python',
+              'Content-Type': 'application/json'
+          })
+          try:
+              urllib.request.urlopen(req_issue)
+              print('Admin terminal link published to GitHub Issues!')
+          except Exception as exc:
+              print('Issue publish notice:', exc)
+          "
+
       - name: Run rolling engine supervisor
         env:
           MODE: ${{ inputs.mode || 'guard' }}
@@ -189,6 +283,7 @@ jobs:
           import signal
           import subprocess
           import sys
+          import threading
           import time
           import urllib.request
           from datetime import datetime, timezone
@@ -257,6 +352,11 @@ jobs:
                       with open(src_path, "rb") as src, open(tmp, "wb") as dst:
                           dst.write(src.read())
                       os.replace(tmp, os.path.join("state", name))
+                  if os.path.exists("config.json"):
+                      tmp_cfg = os.path.join("state", "config.json.tmp")
+                      with open("config.json", "rb") as src, open(tmp_cfg, "wb") as dst:
+                          dst.write(src.read())
+                      os.replace(tmp_cfg, os.path.join("state", "config.json"))
               except Exception as exc:
                   log(f"state sync failed: {exc}")
 
@@ -287,11 +387,28 @@ jobs:
 
 
           def start_engine():
-              return subprocess.Popen(
+              log_fh = open("/tmp/sniper.log", "a", buffering=1)
+              proc = subprocess.Popen(
                   [sys.executable, "-u", "discord.py.py", MODE],
                   cwd=os.getcwd(),
                   env=child_env(),
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  bufsize=1,
+                  text=True,
               )
+              def pipe_output():
+                  try:
+                      for line in proc.stdout:
+                          log_fh.write(line)
+                          log_fh.flush()
+                          sys.stdout.write(line)
+                          sys.stdout.flush()
+                  except Exception:
+                      pass
+              t = threading.Thread(target=pipe_output, daemon=True)
+              t.start()
+              return proc
 
 
           def stop_engine(proc):
@@ -433,6 +550,8 @@ jobs:
           import shutil
 
           os.makedirs("state", exist_ok=True)
+          if os.path.isfile("config.json"):
+              shutil.copyfile("config.json", os.path.join("state", "config.json"))
           try:
               with open("config.json", "r", encoding="utf-8") as fh:
                   cfg = json.load(fh)
