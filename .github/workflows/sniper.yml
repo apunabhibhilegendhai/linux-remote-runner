@@ -50,6 +50,10 @@ jobs:
 
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
           sudo sysctl -w net.core.default_qdisc=fq || true
+          sudo sysctl -w net.core.busy_read=50 || true
+          sudo sysctl -w net.core.busy_poll=50 || true
+          sudo sysctl -w net.ipv4.tcp_low_latency=1 || true
+          sudo sysctl -w net.ipv4.tcp_adv_win_scale=2 || true
           sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
           sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0 || true
           sudo sysctl -w net.ipv4.tcp_notsent_lowat=1024 || true
@@ -389,7 +393,7 @@ jobs:
           def start_engine():
               log_fh = open("/tmp/sniper.log", "a", buffering=1)
               proc = subprocess.Popen(
-                  [sys.executable, "-u", "discord.py.py", MODE],
+                  ["taskset", "-c", "1,2", sys.executable, "-u", "discord.py.py", MODE],
                   cwd=os.getcwd(),
                   env=child_env(),
                   stdout=subprocess.PIPE,
@@ -397,6 +401,11 @@ jobs:
                   bufsize=1,
                   text=True,
               )
+              try:
+                  subprocess.run(["sudo", "renice", "-n", "-20", "-p", str(proc.pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  subprocess.run(["sudo", "chrt", "-f", "-p", "99", str(proc.pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              except Exception:
+                  pass
               def pipe_output():
                   try:
                       for line in proc.stdout:
