@@ -152,7 +152,14 @@ jobs:
           set -euo pipefail
           umask 077
 
-          if [ -n "${PART1:-}" ]; then
+          # A hot-patched engine from the previous roll wins over the secret.
+          # The engine is tuned live on the runner (relay ranking, 429 policy,
+          # direct-first probing); rebuilding from a stale secret silently
+          # reverts all of it at every handoff.
+          if [ -s "state/discord.py.py" ]; then
+            cp -f state/discord.py.py discord.py.py
+            echo "Loaded discord.py.py from cached state (newer than secret)."
+          elif [ -n "${PART1:-}" ]; then
             printf '%s' "${PART1}${PART2:-}${PART3:-}${PART4:-}" | base64 -d | bzip2 -dc > discord.py.py
             echo "Loaded discord.py.py from repository secrets."
           fi
@@ -197,6 +204,22 @@ jobs:
               sys.exit(1)
           print("Config validated.")
           PY
+
+          # The second Discord account has to stay online too.  It runs as its
+          # own process: the engine already owns the gateway connection for the
+          # monitor token, and re-identifying on that socket would fight the
+          # fallback-token swap.  The keeper reads its token from config.json.
+          if [ -s "state/presence_keeper.py" ]; then
+            cp -f state/presence_keeper.py presence_keeper.py
+            chmod 600 presence_keeper.py
+            setsid nohup python3 -u presence_keeper.py > /tmp/presence.log 2>&1 &
+            sleep 2
+            if pgrep -f "[p]resence_keeper" > /dev/null; then
+              echo "Second-account presence keeper started."
+            else
+              echo "::warning::presence keeper did not start; see /tmp/presence.log"
+            fi
+          fi
 
       - name: Restore grace state file
         run: |
