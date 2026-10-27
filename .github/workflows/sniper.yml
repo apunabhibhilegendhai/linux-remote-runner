@@ -170,11 +170,44 @@ jobs:
           fi
           python -m py_compile discord.py.py
 
+          if [ -n "${CFG:-}" ]; then
+            printf '%s' "${CFG}" | base64 -d > /tmp/cfg_secret.json
+          fi
+
           if [ -f "state/config.json" ] && [ -s "state/config.json" ]; then
-            cp -f state/config.json config.json
-            echo "Loaded cached config.json from previous roll."
-          elif [ -n "${CFG:-}" ]; then
-            printf '%s' "${CFG}" | base64 -d > config.json
+            # If CFG is provided and has different tokens, secret takes precedence
+            set +e
+            python3 - <<'PY'
+import json, sys
+try:
+    with open("state/config.json") as f:
+        cached = json.load(f)
+    with open("/tmp/cfg_secret.json") as f:
+        secret = json.load(f)
+    c_tok = cached.get("sniper_token") or cached.get("token")
+    s_tok = secret.get("sniper_token") or secret.get("token")
+    c_mon = cached.get("monitor_token")
+    s_mon = secret.get("monitor_token")
+    if (s_tok and s_tok != c_tok) or (s_mon and s_mon != c_mon):
+        print("Updated tokens detected in repository secrets; overriding state cache.")
+        sys.exit(1)
+except Exception:
+    pass
+sys.exit(0)
+PY
+            DIFF_STATUS=$?
+            set -e
+            if [ $DIFF_STATUS -eq 0 ]; then
+              cp -f state/config.json config.json
+              echo "Loaded cached config.json from previous roll."
+            else
+              cp -f /tmp/cfg_secret.json config.json
+              cp -f /tmp/cfg_secret.json state/config.json
+              echo "Overrode cached config.json with newly updated secret tokens."
+            fi
+          elif [ -f "/tmp/cfg_secret.json" ]; then
+            cp -f /tmp/cfg_secret.json config.json
+            echo "Loaded config.json from repository secret."
           fi
 
           if [ ! -s config.json ]; then
