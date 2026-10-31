@@ -6,11 +6,11 @@ on:
       mode:
         description: "Toolkit mode (guard, sniper, grace, swap)"
         required: true
-        default: "guard"
+        default: "sniper"
         type: choice
         options:
-          - guard
           - sniper
+          - guard
           - grace
           - swap
 
@@ -113,7 +113,11 @@ jobs:
           if [ "$IS_SLOW" = "1" ]; then
             echo "::warning::Runner RTT is ${PING_MS}ms (outside US-East). Re-rolling to catch an Azure eastus runner (<4ms)..."
             if [ -n "${GITHUB_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
-              curl -s -X POST                 -H "Authorization: Bearer ${GITHUB_TOKEN}"                 -H "Accept: application/vnd.github.v3+json"                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/sniper.yml/dispatches"                 -d "{"ref":"${GITHUB_REF_NAME:-main}","inputs":{"mode":"${{ inputs.mode || 'guard' }}"}}" || true
+              curl -s -X POST \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/sniper.yml/dispatches" \
+                -d "{\"ref\":\"${GITHUB_REF_NAME:-main}\",\"inputs\":{\"mode\":\"${{ inputs.mode || 'sniper' }}\"}}" || true
             fi
             echo "Clean re-roll exit to guarantee < 20ms latency."
             exit 0
@@ -427,7 +431,7 @@ jobs:
 
       - name: Run rolling engine supervisor
         env:
-          MODE: ${{ inputs.mode || 'guard' }}
+          MODE: ${{ inputs.mode || 'sniper' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -443,7 +447,7 @@ jobs:
           import urllib.request
           from datetime import datetime, timezone
 
-          MODE = os.environ.get("MODE", "guard")
+          MODE = os.environ.get("MODE", "sniper")
           REPO = os.environ.get("GITHUB_REPOSITORY", "")
           REF = os.environ.get("GITHUB_REF_NAME", "main")
           TOKEN = os.environ.get("GITHUB_TOKEN", "")
